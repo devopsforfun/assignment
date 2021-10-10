@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "grofers-keyvalue.fullname" . }}
+  labels:
+    {{- include "grofers-keyvalue.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "grofers-keyvalue.selectorLabels" . | nindent 4 }}

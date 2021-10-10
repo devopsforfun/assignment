@@ -1,0 +1,124 @@
+pipeline {
+    agent {
+        node {
+            label "${Slave_Label}"
+        }
+    }
+    environment {
+       nexus_repo = 'http://nexus.k8s.local'
+       repo_name = 'grofers-keyvalue'
+       working_dir = 'infra'
+     #  docker_registry = ''
+   } 
+    stages {
+        stage('StaticAnalysis: helm_lint') {
+            when {
+                // Only run verification if build param is verify
+                expression { params.Action == 'Verify' }
+            }
+            steps {
+		sh "echo linting helm chart"
+                sh "kube-linter lint ${working_dir}/charts --exclude no-read-only-root-fs,,run-as-non-root"
+                           }
+        }
+        
+        stage('StaticAnalysis: docker_lint ') {
+           when {
+                // Only run verification if build param is verify
+                expression { params.Action == 'Verify' }
+            }
+            steps {
+               catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                sh "/bin/hadolint infra/docker/Dockerfile --ignore DL3016 --ignore DL3059 --ignore DL3025"
+            }
+        }
+	}
+        stage('StaticAnalysis: secret_check') {
+           when {
+                // Only run verification if build param is verify
+               expression { params.Action == 'Verify' }
+            }
+            steps {
+                sh "/usr/local/bin/gitleaks --path=${WORKSPACE} -v -f csv --depth=5"
+            }
+        }
+        
+        stage('StaticAnalysis: groovy_lint') {
+           when {
+                // Only run verification if build param is verify
+                expression { params.Action == 'Verify' }
+            }
+            steps {
+                sh "npm-groovy-lint --path 'infra/jenkins/' --files 'JenkinsfileStaging' --output txt"
+            }
+        }
+
+        stage('docker_build ') {
+	   when {
+                // Only run verification if build param is verify
+                expression { params.Action == 'Verify' }
+            }
+            steps {
+		sh "sudo docker build -t ${BUILD_NUMBER} -f ${working_dir}/docker/Dockerfile ."
+		sh "echo Cleaning Images"
+		sh "sudo docker rmi -f ${BUILD_NUMBER}"
+            }
+        }
+        
+
+        stage('docker_push ') {
+	    when {
+                // Only run verification if build param is verify
+                expression { params.Action == 'Deploy' }
+            }
+            steps {
+		sh '''
+		image_name=`cat ${working_dir}/charts/${repo_name}/values.yaml | shyaml get-value image.repository`
+                image_tag=`cat ${working_dir}/charts/${repo_name}/values.yaml | shyaml get-value image.tag`
+                sudo docker build -t ${image_name}:${image_tag} -f ${working_dir}/docker/Dockerfile .
+		echo "Authenticating remote repository"
+		sudo docker push ${image_name}:${image_tag}
+                '''
+            }
+        }
+        stage('helm_chart_create ') {
+            when {
+                expression { params.Action == 'Deploy' }
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'helm-repo-cred', passwordVariable: 'password', usernameVariable: 'user')]) {
+		sh '''
+		mkdir ${working_dir}/temp
+		helm package ${working_dir}/charts/${repo_name} -d ${working_dir}/temp/
+		'''
+             }
+            }
+        }
+	stage('helm_chart_push ') {
+            when {
+                // Only run verification if build param is verify
+                expression { params.Action == 'Deploy' }
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'helm-repo-cred', passwordVariable: 'password', usernameVariable: 'user')]) {
+                sh '''
+		chart_name=`ls ${working_dir}/temp/*.tgz |  cut -d/ -f3`
+		echo ${chart_name} > ${working_dir}/temp/chart_name
+                status=`curl -L -u admin:${password}  ${nexus_repo}/repository/${repo_name}/${chart_name} -o /dev/null -w '%{http_code}\n' -s`
+		echo "Checking if ${chart_name} exists"
+		if  [ ${status} -ne 200 ]; then echo "${chart_name} doesnt exist Proceeding"; else echo "${chart_name} already exists in ${nexus_repo}"; exit 1; fi
+		curl --silent --show-error -F file=@${working_dir}/temp/${chart_name} -u admin:${password} ${nexus_repo}/service/rest/v1/components?repository=${repo_name}
+                '''
+             }
+            }
+        }
+        
+    } 
+
+    post {
+        always {
+            cleanWs()
+        }
+    }
+}
+
